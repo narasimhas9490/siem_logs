@@ -1,19 +1,21 @@
 import os
 import json
 import gzip
+import re
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from clickhouse_connect import get_client
 
+
 # Load .env for local development.
-# On Vercel, Environment Variables are used automatically.
+# Vercel uses Environment Variables automatically.
 load_dotenv()
 
-# IMPORTANT:
-# Vercel looks for a top-level Flask instance named "app".
+
 app = Flask(__name__)
+
 
 TABLE_NAME = os.getenv(
     "CLICKHOUSE_TABLE",
@@ -22,16 +24,16 @@ TABLE_NAME = os.getenv(
 
 
 def get_ch_client():
-    required_vars = [
+    required = [
         "CLICKHOUSE_HOST",
         "CLICKHOUSE_USER",
         "CLICKHOUSE_PASSWORD",
     ]
 
     missing = [
-        var
-        for var in required_vars
-        if not os.getenv(var)
+        key
+        for key in required
+        if not os.getenv(key)
     ]
 
     if missing:
@@ -48,12 +50,8 @@ def get_ch_client():
                 "8443",
             )
         ),
-        username=os.environ[
-            "CLICKHOUSE_USER"
-        ],
-        password=os.environ[
-            "CLICKHOUSE_PASSWORD"
-        ],
+        username=os.environ["CLICKHOUSE_USER"],
+        password=os.environ["CLICKHOUSE_PASSWORD"],
         database=os.getenv(
             "CLICKHOUSE_DATABASE",
             "default",
@@ -61,21 +59,20 @@ def get_ch_client():
         secure=os.getenv(
             "CLICKHOUSE_SECURE",
             "true",
-        ).lower()
-        == "true",
+        ).lower() == "true",
     )
 
 
 def parse_request_body(req):
     raw = req.get_data()
 
-    content_encoding = req.headers.get(
+    encoding = req.headers.get(
         "Content-Encoding",
         "",
     ).lower()
 
     if (
-        "gzip" in content_encoding
+        "gzip" in encoding
         or raw.startswith(b"\x1f\x8b")
     ):
         raw = gzip.decompress(raw)
@@ -85,18 +82,18 @@ def parse_request_body(req):
     )
 
 
-def flatten(data, parent_key=""):
-    result = {}
+def flatten(data, parent=""):
+    output = {}
 
     if isinstance(data, dict):
         for key, value in data.items():
             new_key = (
-                f"{parent_key}_{key}"
-                if parent_key
+                f"{parent}_{key}"
+                if parent
                 else key
             )
 
-            result.update(
+            output.update(
                 flatten(
                     value,
                     new_key,
@@ -104,36 +101,37 @@ def flatten(data, parent_key=""):
             )
 
     elif isinstance(data, list):
-        result[parent_key] = json.dumps(
+        output[parent] = json.dumps(
             data,
             ensure_ascii=False,
         )
 
     else:
-        result[parent_key] = (
+        output[parent] = (
             str(data)
             if data is not None
             else None
         )
 
-    return result
+    return output
 
 
 def sanitize_column_name(name):
-    return "".join(
-        ch.lower()
-        if ch.isalnum()
-        else "_"
-        for ch in name
+    name = re.sub(
+        r"[^a-zA-Z0-9_]",
+        "_",
+        name,
     )
+
+    return name.lower()
 
 
 def ensure_table_exists(client):
     client.command(
         f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_NAME}
+        CREATE TABLE IF NOT EXISTS `{TABLE_NAME}`
         (
-            received_at DateTime
+            received_at DateTime('UTC')
         )
         ENGINE = MergeTree
         ORDER BY received_at
@@ -143,7 +141,7 @@ def ensure_table_exists(client):
 
 def get_existing_columns(client):
     result = client.query(
-        f"DESCRIBE TABLE {TABLE_NAME}"
+        f"DESCRIBE TABLE `{TABLE_NAME}`"
     )
 
     return {
@@ -152,19 +150,14 @@ def get_existing_columns(client):
     }
 
 
-def add_missing_columns(
-    client,
-    columns,
-):
-    existing = (
-        get_existing_columns(client)
-    )
+def add_missing_columns(client, columns):
+    existing = get_existing_columns(client)
 
     for column in columns:
         if column not in existing:
             client.command(
                 f"""
-                ALTER TABLE {TABLE_NAME}
+                ALTER TABLE `{TABLE_NAME}`
                 ADD COLUMN IF NOT EXISTS
                 `{column}`
                 Nullable(String)
@@ -184,121 +177,104 @@ def health():
 
 @app.route("/", methods=["POST"])
 def webhook():
+
     try:
-        payload = parse_request_body(
-            request
-        )
+        payload = parse_request_body(request)
 
-        if not isinstance(
-            payload,
-            dict,
-        ):
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": (
-                            "JSON root must be an object"
-                        ),
-                    }
-                ),
-                400,
-            )
+        if not isinstance(payload, dict):
+            return jsonify(
+                {
+                    "success": False,
+                    "error": (
+                        "JSON root must be an object"
+                    ),
+                }
+            ), 400
 
-        flattened = flatten(
-            payload
-        )
 
-        sanitized = {
-            sanitize_column_name(
-                key
-            ): value
-            for key, value in (
-                flattened.items()
-            )
+        flattened = flatten(payload)
+
+
+        data = {
+            sanitize_column_name(key): value
+            for key, value in flattened.items()
         }
 
-        client = (
-            get_ch_client()
-        )
 
-        ensure_table_exists(
-            client
-        )
+        client = get_ch_client()
+
+
+        ensure_table_exists(client)
+
 
         add_missing_columns(
             client,
-            sanitized.keys(),
+            data.keys(),
         )
+
 
         row = {
             "received_at": datetime.now(
                 timezone.utc
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
             ),
-            **sanitized,
+            **data,
         }
+
+
+        columns = list(row.keys())
+
 
         client.insert(
             TABLE_NAME,
-            [list(row.values())],
-            column_names=list(
-                row.keys()
-            ),
+            [
+                [
+                    row[column]
+                    for column in columns
+                ]
+            ],
+            column_names=columns,
         )
+
 
         return jsonify(
             {
                 "success": True,
-                "columns_inserted": len(
-                    sanitized
-                ),
+                "columns_inserted": len(data),
             }
         )
 
+
     except gzip.BadGzipFile:
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": (
-                        "Invalid gzip payload"
-                    ),
-                }
-            ),
-            400,
-        )
+        return jsonify(
+            {
+                "success": False,
+                "error": "Invalid gzip payload",
+            }
+        ), 400
+
 
     except json.JSONDecodeError:
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": (
-                        "Invalid JSON payload"
-                    ),
-                }
-            ),
-            400,
-        )
+        return jsonify(
+            {
+                "success": False,
+                "error": "Invalid JSON payload",
+            }
+        ), 400
+
 
     except Exception as exc:
         app.logger.exception(
             "Webhook processing failed"
         )
 
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": str(exc),
-                }
-            ),
-            500,
-        )
+        return jsonify(
+            {
+                "success": False,
+                "error": str(exc),
+            }
+        ), 500
 
 
-# Explicit export for Vercel
+
+# Vercel entrypoint
 app = app
-
