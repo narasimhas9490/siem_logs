@@ -1,4 +1,3 @@
-```python
 import os
 import json
 import gzip
@@ -8,17 +7,39 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from clickhouse_connect import get_client
 
+# Load .env for local development.
+# On Vercel, Environment Variables are used automatically.
 load_dotenv()
 
+# IMPORTANT:
+# Vercel looks for a top-level Flask instance named "app".
 app = Flask(__name__)
 
 TABLE_NAME = os.getenv(
     "CLICKHOUSE_TABLE",
-    "webhook_events",
+    "webhook_events"
 )
 
 
 def get_ch_client():
+    required_vars = [
+        "CLICKHOUSE_HOST",
+        "CLICKHOUSE_USER",
+        "CLICKHOUSE_PASSWORD",
+    ]
+
+    missing = [
+        var
+        for var in required_vars
+        if not os.getenv(var)
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Missing environment variables: "
+            + ", ".join(missing)
+        )
+
     return get_client(
         host=os.environ["CLICKHOUSE_HOST"],
         port=int(
@@ -53,12 +74,10 @@ def parse_request_body(req):
         "",
     ).lower()
 
-    is_gzip = (
+    if (
         "gzip" in content_encoding
         or raw.startswith(b"\x1f\x8b")
-    )
-
-    if is_gzip:
+    ):
         raw = gzip.decompress(raw)
 
     return json.loads(
@@ -101,20 +120,12 @@ def flatten(data, parent_key=""):
 
 
 def sanitize_column_name(name):
-    sanitized = []
-
-    for ch in name:
-        if (
-            ch.isalnum()
-            or ch == "_"
-        ):
-            sanitized.append(ch)
-        else:
-            sanitized.append("_")
-
     return "".join(
-        sanitized
-    ).lower()
+        ch.lower()
+        if ch.isalnum()
+        else "_"
+        for ch in name
+    )
 
 
 def ensure_table_exists(client):
@@ -132,9 +143,7 @@ def ensure_table_exists(client):
 
 def get_existing_columns(client):
     result = client.query(
-        f"""
-        DESCRIBE TABLE {TABLE_NAME}
-        """
+        f"DESCRIBE TABLE {TABLE_NAME}"
     )
 
     return {
@@ -147,15 +156,12 @@ def add_missing_columns(
     client,
     columns,
 ):
-    existing_columns = (
+    existing = (
         get_existing_columns(client)
     )
 
     for column in columns:
-        if (
-            column
-            not in existing_columns
-        ):
+        if column not in existing:
             client.command(
                 f"""
                 ALTER TABLE {TABLE_NAME}
@@ -166,28 +172,21 @@ def add_missing_columns(
             )
 
 
-@app.route(
-    "/",
-    methods=["GET"],
-)
+@app.route("/", methods=["GET"])
 def health():
     return jsonify(
         {
             "status": "ok",
+            "table": TABLE_NAME,
         }
     )
 
 
-@app.route(
-    "/",
-    methods=["POST"],
-)
+@app.route("/", methods=["POST"])
 def webhook():
     try:
-        payload = (
-            parse_request_body(
-                request
-            )
+        payload = parse_request_body(
+            request
         )
 
         if not isinstance(
@@ -199,8 +198,7 @@ def webhook():
                     {
                         "success": False,
                         "error": (
-                            "JSON root "
-                            "must be an object"
+                            "JSON root must be an object"
                         ),
                     }
                 ),
@@ -301,5 +299,6 @@ def webhook():
         )
 
 
+# Explicit export for Vercel
 app = app
-```
+
