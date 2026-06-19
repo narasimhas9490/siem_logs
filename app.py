@@ -1,38 +1,69 @@
+```python
 import os
 import json
 import gzip
-from datetime import datetime
+from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from clickhouse_connect import get_client
 
+load_dotenv()
+
 app = Flask(__name__)
 
-TABLE_NAME = "webhook_events"
+TABLE_NAME = os.getenv(
+    "CLICKHOUSE_TABLE",
+    "webhook_events",
+)
 
 
 def get_ch_client():
     return get_client(
         host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.getenv("CLICKHOUSE_PORT", "8443")),
-        username=os.environ["CLICKHOUSE_USER"],
-        password=os.environ["CLICKHOUSE_PASSWORD"],
-        database=os.getenv("CLICKHOUSE_DATABASE", "default"),
-        secure=True,
+        port=int(
+            os.getenv(
+                "CLICKHOUSE_PORT",
+                "8443",
+            )
+        ),
+        username=os.environ[
+            "CLICKHOUSE_USER"
+        ],
+        password=os.environ[
+            "CLICKHOUSE_PASSWORD"
+        ],
+        database=os.getenv(
+            "CLICKHOUSE_DATABASE",
+            "default",
+        ),
+        secure=os.getenv(
+            "CLICKHOUSE_SECURE",
+            "true",
+        ).lower()
+        == "true",
     )
 
 
 def parse_request_body(req):
     raw = req.get_data()
 
-    content_encoding = req.headers.get("Content-Encoding", "").lower()
+    content_encoding = req.headers.get(
+        "Content-Encoding",
+        "",
+    ).lower()
 
-    if "gzip" in content_encoding:
+    is_gzip = (
+        "gzip" in content_encoding
+        or raw.startswith(b"\x1f\x8b")
+    )
+
+    if is_gzip:
         raw = gzip.decompress(raw)
 
-    text = raw.decode("utf-8")
-
-    return json.loads(text)
+    return json.loads(
+        raw.decode("utf-8")
+    )
 
 
 def flatten(data, parent_key=""):
@@ -40,14 +71,31 @@ def flatten(data, parent_key=""):
 
     if isinstance(data, dict):
         for key, value in data.items():
-            new_key = f"{parent_key}_{key}" if parent_key else key
-            result.update(flatten(value, new_key))
+            new_key = (
+                f"{parent_key}_{key}"
+                if parent_key
+                else key
+            )
+
+            result.update(
+                flatten(
+                    value,
+                    new_key,
+                )
+            )
 
     elif isinstance(data, list):
-        result[parent_key] = json.dumps(data)
+        result[parent_key] = json.dumps(
+            data,
+            ensure_ascii=False,
+        )
 
     else:
-        result[parent_key] = str(data) if data is not None else None
+        result[parent_key] = (
+            str(data)
+            if data is not None
+            else None
+        )
 
     return result
 
@@ -56,12 +104,17 @@ def sanitize_column_name(name):
     sanitized = []
 
     for ch in name:
-        if ch.isalnum() or ch == "_":
+        if (
+            ch.isalnum()
+            or ch == "_"
+        ):
             sanitized.append(ch)
         else:
             sanitized.append("_")
 
-    return "".join(sanitized).lower()
+    return "".join(
+        sanitized
+    ).lower()
 
 
 def ensure_table_exists(client):
@@ -78,76 +131,175 @@ def ensure_table_exists(client):
 
 
 def get_existing_columns(client):
-    result = client.query(f"DESCRIBE TABLE {TABLE_NAME}")
-    return {row[0] for row in result.result_rows}
+    result = client.query(
+        f"""
+        DESCRIBE TABLE {TABLE_NAME}
+        """
+    )
+
+    return {
+        row[0]
+        for row in result.result_rows
+    }
 
 
-def add_missing_columns(client, columns):
-    existing = get_existing_columns(client)
+def add_missing_columns(
+    client,
+    columns,
+):
+    existing_columns = (
+        get_existing_columns(client)
+    )
 
     for column in columns:
-        if column not in existing:
+        if (
+            column
+            not in existing_columns
+        ):
             client.command(
                 f"""
                 ALTER TABLE {TABLE_NAME}
-                ADD COLUMN IF NOT EXISTS `{column}` Nullable(String)
+                ADD COLUMN IF NOT EXISTS
+                `{column}`
+                Nullable(String)
                 """
             )
 
 
-@app.route("/", methods=["POST"])
+@app.route(
+    "/",
+    methods=["GET"],
+)
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+        }
+    )
+
+
+@app.route(
+    "/",
+    methods=["POST"],
+)
 def webhook():
     try:
-        payload = parse_request_body(request)
+        payload = (
+            parse_request_body(
+                request
+            )
+        )
 
-        flat_data = flatten(payload)
+        if not isinstance(
+            payload,
+            dict,
+        ):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": (
+                            "JSON root "
+                            "must be an object"
+                        ),
+                    }
+                ),
+                400,
+            )
+
+        flattened = flatten(
+            payload
+        )
 
         sanitized = {
-            sanitize_column_name(k): v
-            for k, v in flat_data.items()
+            sanitize_column_name(
+                key
+            ): value
+            for key, value in (
+                flattened.items()
+            )
         }
 
-        client = get_ch_client()
+        client = (
+            get_ch_client()
+        )
 
-        ensure_table_exists(client)
-        add_missing_columns(client, sanitized.keys())
+        ensure_table_exists(
+            client
+        )
+
+        add_missing_columns(
+            client,
+            sanitized.keys(),
+        )
 
         row = {
-            "received_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "received_at": datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
             **sanitized,
         }
 
         client.insert(
             TABLE_NAME,
             [list(row.values())],
-            column_names=list(row.keys()),
+            column_names=list(
+                row.keys()
+            ),
         )
-        
 
         return jsonify(
             {
                 "success": True,
-                "columns_inserted": len(sanitized),
+                "columns_inserted": len(
+                    sanitized
+                ),
             }
         )
 
-    except Exception as e:
-        print("ERROR:", str(e))
-        return jsonify(
-            {
-                "success": False,
-                "error": str(e),
-            }
-        ), 500
+    except gzip.BadGzipFile:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": (
+                        "Invalid gzip payload"
+                    ),
+                }
+            ),
+            400,
+        )
 
+    except json.JSONDecodeError:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": (
+                        "Invalid JSON payload"
+                    ),
+                }
+            ),
+            400,
+        )
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify(
-        {
-            "status": "ok"
-        }
-    )
+    except Exception as exc:
+        app.logger.exception(
+            "Webhook processing failed"
+        )
+
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": str(exc),
+                }
+            ),
+            500,
+        )
 
 
 app = app
+```
