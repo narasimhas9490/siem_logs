@@ -1,1 +1,3 @@
 Flask
+clickhouse-connect
+python-dotenv
