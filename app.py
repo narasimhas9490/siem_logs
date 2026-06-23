@@ -4,6 +4,7 @@ import json
 import gzip
 import base64
 import re
+import traceback
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
@@ -15,7 +16,10 @@ load_dotenv()
 
 app = Flask(__name__)
 
-TABLE_NAME = os.getenv("CLICKHOUSE_TABLE", "webhook_events")
+TABLE_NAME = os.getenv(
+    "CLICKHOUSE_TABLE",
+    "webhook_events"
+)
 
 DECODE_FIELDS = {
     "attackdata_rules",
@@ -27,6 +31,12 @@ DECODE_FIELDS = {
     "attackdata_ruleactions",
 }
 
+URL_DECODE_FIELDS = {
+    "httpmessage_requestheaders",
+    "httpmessage_responseheaders",
+    "httpmessage_query",
+}
+
 
 def get_ch_client():
     return get_client(
@@ -34,8 +44,14 @@ def get_ch_client():
         port=int(os.getenv("CLICKHOUSE_PORT", "8443")),
         username=os.getenv("CLICKHOUSE_USER"),
         password=os.getenv("CLICKHOUSE_PASSWORD"),
-        database=os.getenv("CLICKHOUSE_DATABASE", "default"),
-        secure=os.getenv("CLICKHOUSE_SECURE", "true").lower() == "true",
+        database=os.getenv(
+            "CLICKHOUSE_DATABASE",
+            "default"
+        ),
+        secure=os.getenv(
+            "CLICKHOUSE_SECURE",
+            "true"
+        ).lower() == "true",
     )
 
 
@@ -43,79 +59,122 @@ def parse_request_body(req):
     raw = req.get_data()
 
     if (
-        "gzip" in req.headers.get("Content-Encoding", "").lower()
+        "gzip" in req.headers.get(
+            "Content-Encoding",
+            ""
+        ).lower()
         or raw.startswith(b"\x1f\x8b")
     ):
         raw = gzip.decompress(raw)
 
-    return json.loads(raw.decode("utf-8", errors="replace"))
+    return json.loads(
+        raw.decode(
+            "utf-8",
+            errors="replace"
+        )
+    )
 
 
-def flatten(obj, prefix=""):
+def flatten(data, parent=""):
     result = {}
 
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key = f"{prefix}_{k}" if prefix else k
-            result.update(flatten(v, key))
+    if isinstance(data, dict):
 
-    elif isinstance(obj, list):
-        result[prefix] = json.dumps(obj, ensure_ascii=False)
+        for key, value in data.items():
+
+            new_key = (
+                f"{parent}_{key}"
+                if parent
+                else key
+            )
+
+            result.update(
+                flatten(
+                    value,
+                    new_key
+                )
+            )
+
+    elif isinstance(data, list):
+
+        result[parent] = json.dumps(
+            data,
+            ensure_ascii=False
+        )
 
     else:
-        result[prefix] = obj
+
+        result[parent] = data
 
     return result
 
 
-def sanitize(name):
-    return re.sub(r"[^a-zA-Z0-9_]", "_", name).lower()
+def sanitize_column_name(name):
+    return re.sub(
+        r"[^a-zA-Z0-9_]",
+        "_",
+        name
+    ).lower()
 
 
 def decode_encoded_list(value):
-    output = []
+    decoded_items = []
 
-    for item in unquote(value).split(";"):
+    decoded_url = unquote(value)
+
+    for item in decoded_url.split(";"):
+
         item = item.strip()
 
         if not item:
             continue
 
         try:
-            output.append(
-                base64.b64decode(item).decode(
+            decoded_items.append(
+                base64.b64decode(item)
+                .decode(
                     "utf-8",
                     errors="replace"
                 )
             )
         except Exception:
-            output.append(item)
+            decoded_items.append(item)
 
-    return output
+    return decoded_items
 
 
 def process_fields(data):
-    result = {}
+    processed = {}
 
-    for k, v in data.items():
+    for key, value in data.items():
+
+        if value is None:
+            processed[key] = None
+            continue
 
         if (
-            k in DECODE_FIELDS
-            and isinstance(v, str)
+            key in DECODE_FIELDS
+            and isinstance(value, str)
         ):
-            result[k] = json.dumps(
-                decode_encoded_list(v),
+            processed[key] = json.dumps(
+                decode_encoded_list(value),
                 ensure_ascii=False
             )
+
+        elif (
+            key in URL_DECODE_FIELDS
+            and isinstance(value, str)
+        ):
+            processed[key] = unquote(value)
+
         else:
-            result[k] = (
-                None if v is None else str(v)
-            )
+            processed[key] = str(value)
 
-    return result
+    return processed
 
 
-def ensure_table(client):
+def ensure_table_exists(client):
+
     client.command(
         f"""
         CREATE TABLE IF NOT EXISTS `{TABLE_NAME}`
@@ -129,37 +188,42 @@ def ensure_table(client):
 
 
 def get_schema(client):
-    rows = client.query(
+
+    result = client.query(
         f"DESCRIBE TABLE `{TABLE_NAME}`"
-    ).result_rows
+    )
 
     return {
         row[0]: row[1]
-        for row in rows
+        for row in result.result_rows
     }
 
 
 def add_missing_columns(client, columns):
+
     schema = get_schema(client)
 
-    for col in columns:
-        if col not in schema:
+    for column in columns:
+
+        if column not in schema:
+
             client.command(
                 f"""
                 ALTER TABLE `{TABLE_NAME}`
                 ADD COLUMN IF NOT EXISTS
-                `{col}` Nullable(String)
+                `{column}` Nullable(String)
                 """
             )
 
 
 def convert_datetime_columns(client, row):
+
     schema = get_schema(client)
 
     for column, column_type in schema.items():
 
         if (
-            "DateTime" in column_type
+            "DateTime" in str(column_type)
             and column in row
             and isinstance(row[column], str)
         ):
@@ -178,34 +242,43 @@ def convert_datetime_columns(client, row):
 
 @app.route("/", methods=["GET"])
 def health():
-    return {
-        "status": "ok"
-    }
+
+    return jsonify({
+        "status": "ok",
+        "table": TABLE_NAME
+    })
 
 
 @app.route("/", methods=["POST"])
 def webhook():
-    try:
-        payload = parse_request_body(request)
 
-        if not isinstance(payload, dict):
+    try:
+
+        payload = parse_request_body(
+            request
+        )
+
+        if not isinstance(
+            payload,
+            dict
+        ):
             return jsonify({
                 "success": False,
                 "error": "JSON root must be object"
             }), 400
 
-        flat = flatten(payload)
+        flattened = flatten(payload)
 
         data = {
-            sanitize(k): v
-            for k, v in flat.items()
+            sanitize_column_name(k): v
+            for k, v in flattened.items()
         }
 
         data = process_fields(data)
 
         client = get_ch_client()
 
-        ensure_table(client)
+        ensure_table_exists(client)
 
         add_missing_columns(
             client,
@@ -224,11 +297,13 @@ def webhook():
             row
         )
 
-        columns = list(row.keys())
+        columns = list(
+            row.keys()
+        )
 
         values = [
-            row[c]
-            for c in columns
+            row[col]
+            for col in columns
         ]
 
         client.insert(
@@ -238,15 +313,34 @@ def webhook():
         )
 
         return jsonify({
-            "success": True
+            "success": True,
+            "columns_inserted": len(data)
         })
 
+    except gzip.BadGzipFile as exc:
+
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 400
+
+    except json.JSONDecodeError as exc:
+
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 400
+
     except Exception as exc:
-        import traceback
+
+        app.logger.exception(
+            "Webhook processing failed"
+        )
 
         return jsonify({
             "success": False,
             "error": str(exc),
+            "type": type(exc).__name__,
             "traceback": traceback.format_exc()
         }), 500
 
@@ -256,6 +350,11 @@ application = app
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 5000))
+        port=int(
+            os.getenv(
+                "PORT",
+                5000
+            )
+        )
     )
 
