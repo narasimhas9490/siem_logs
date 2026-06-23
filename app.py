@@ -1,3 +1,4 @@
+
 import os
 import json
 import gzip
@@ -14,10 +15,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-TABLE_NAME = os.getenv(
-    "CLICKHOUSE_TABLE",
-    "webhook_events"
-)
+TABLE_NAME = os.getenv("CLICKHOUSE_TABLE", "webhook_events")
 
 DECODE_FIELDS = {
     "attackdata_rules",
@@ -36,14 +34,8 @@ def get_ch_client():
         port=int(os.getenv("CLICKHOUSE_PORT", "8443")),
         username=os.getenv("CLICKHOUSE_USER"),
         password=os.getenv("CLICKHOUSE_PASSWORD"),
-        database=os.getenv(
-            "CLICKHOUSE_DATABASE",
-            "default"
-        ),
-        secure=os.getenv(
-            "CLICKHOUSE_SECURE",
-            "true"
-        ).lower() == "true",
+        database=os.getenv("CLICKHOUSE_DATABASE", "default"),
+        secure=os.getenv("CLICKHOUSE_SECURE", "true").lower() == "true",
     )
 
 
@@ -51,77 +43,37 @@ def parse_request_body(req):
     raw = req.get_data()
 
     if (
-        "gzip" in req.headers.get(
-            "Content-Encoding",
-            ""
-        ).lower()
+        "gzip" in req.headers.get("Content-Encoding", "").lower()
         or raw.startswith(b"\x1f\x8b")
     ):
         raw = gzip.decompress(raw)
 
-    return json.loads(
-        raw.decode(
-            "utf-8",
-            errors="replace"
-        )
-    )
+    return json.loads(raw.decode("utf-8", errors="replace"))
 
 
-def flatten(data, parent=""):
+def flatten(obj, prefix=""):
     result = {}
 
-    if isinstance(data, dict):
-        for key, value in data.items():
-            new_key = (
-                f"{parent}_{key}"
-                if parent
-                else key
-            )
-            result.update(
-                flatten(
-                    value,
-                    new_key
-                )
-            )
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}_{k}" if prefix else k
+            result.update(flatten(v, key))
 
-    elif isinstance(data, list):
-        result[parent] = json.dumps(
-            data,
-            ensure_ascii=False
-        )
+    elif isinstance(obj, list):
+        result[prefix] = json.dumps(obj, ensure_ascii=False)
 
     else:
-        result[parent] = value_to_string(data)
+        result[prefix] = obj
 
     return result
 
 
-def value_to_string(value):
-    if value is None:
-        return None
-
-    if isinstance(
-        value,
-        (dict, list)
-    ):
-        return json.dumps(
-            value,
-            ensure_ascii=False
-        )
-
-    return str(value)
-
-
-def sanitize_column_name(name):
-    return re.sub(
-        r"[^a-zA-Z0-9_]",
-        "_",
-        name
-    ).lower()
+def sanitize(name):
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name).lower()
 
 
 def decode_encoded_list(value):
-    decoded = []
+    output = []
 
     for item in unquote(value).split(";"):
         item = item.strip()
@@ -130,39 +82,40 @@ def decode_encoded_list(value):
             continue
 
         try:
-            decoded.append(
-                base64.b64decode(item)
-                .decode(
+            output.append(
+                base64.b64decode(item).decode(
                     "utf-8",
                     errors="replace"
                 )
             )
         except Exception:
-            decoded.append(item)
+            output.append(item)
 
-    return decoded
+    return output
 
 
-def process_special_fields(data):
-    processed = {}
+def process_fields(data):
+    result = {}
 
-    for key, value in data.items():
+    for k, v in data.items():
 
         if (
-            key in DECODE_FIELDS
-            and isinstance(value, str)
+            k in DECODE_FIELDS
+            and isinstance(v, str)
         ):
-            processed[key] = json.dumps(
-                decode_encoded_list(value),
+            result[k] = json.dumps(
+                decode_encoded_list(v),
                 ensure_ascii=False
             )
         else:
-            processed[key] = value
+            result[k] = (
+                None if v is None else str(v)
+            )
 
-    return processed
+    return result
 
 
-def ensure_table_exists(client):
+def ensure_table(client):
     client.command(
         f"""
         CREATE TABLE IF NOT EXISTS `{TABLE_NAME}`
@@ -175,70 +128,84 @@ def ensure_table_exists(client):
     )
 
 
-def get_existing_columns(client):
-    result = client.query(
+def get_schema(client):
+    rows = client.query(
         f"DESCRIBE TABLE `{TABLE_NAME}`"
-    )
+    ).result_rows
 
     return {
-        row[0]
-        for row in result.result_rows
+        row[0]: row[1]
+        for row in rows
     }
 
 
 def add_missing_columns(client, columns):
-    existing = get_existing_columns(client)
+    schema = get_schema(client)
 
-    for column in columns:
-
-        if column not in existing:
-
+    for col in columns:
+        if col not in schema:
             client.command(
                 f"""
                 ALTER TABLE `{TABLE_NAME}`
                 ADD COLUMN IF NOT EXISTS
-                `{column}` Nullable(String)
+                `{col}` Nullable(String)
                 """
             )
 
 
+def convert_datetime_columns(client, row):
+    schema = get_schema(client)
+
+    for column, column_type in schema.items():
+
+        if (
+            "DateTime" in column_type
+            and column in row
+            and isinstance(row[column], str)
+        ):
+            try:
+                row[column] = datetime.fromisoformat(
+                    row[column].replace(
+                        "Z",
+                        "+00:00"
+                    )
+                )
+            except Exception:
+                pass
+
+    return row
+
+
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "table": TABLE_NAME
-    })
+    return {
+        "status": "ok"
+    }
 
 
 @app.route("/", methods=["POST"])
 def webhook():
     try:
+        payload = parse_request_body(request)
 
-        payload = parse_request_body(
-            request
-        )
-
-        if not isinstance(
-            payload,
-            dict
-        ):
+        if not isinstance(payload, dict):
             return jsonify({
                 "success": False,
-                "error": "JSON root must be an object"
+                "error": "JSON root must be object"
             }), 400
 
-        flattened = flatten(payload)
+        flat = flatten(payload)
 
         data = {
-            sanitize_column_name(k): v
-            for k, v in flattened.items()
+            sanitize(k): v
+            for k, v in flat.items()
         }
 
-        data = process_special_fields(data)
+        data = process_fields(data)
 
         client = get_ch_client()
 
-        ensure_table_exists(client)
+        ensure_table(client)
 
         add_missing_columns(
             client,
@@ -252,13 +219,16 @@ def webhook():
             **data
         }
 
-        columns = list(
-            row.keys()
+        row = convert_datetime_columns(
+            client,
+            row
         )
 
+        columns = list(row.keys())
+
         values = [
-            row[col]
-            for col in columns
+            row[c]
+            for c in columns
         ]
 
         client.insert(
@@ -268,22 +238,15 @@ def webhook():
         )
 
         return jsonify({
-            "success": True,
-            "columns_inserted": len(data)
+            "success": True
         })
 
     except Exception as exc:
-
         import traceback
-
-        app.logger.exception(
-            "Webhook processing failed"
-        )
 
         return jsonify({
             "success": False,
             "error": str(exc),
-            "type": type(exc).__name__,
             "traceback": traceback.format_exc()
         }), 500
 
@@ -293,10 +256,6 @@ application = app
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                5000
-            )
-        )
+        port=int(os.getenv("PORT", 5000))
     )
+
