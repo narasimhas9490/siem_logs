@@ -3,20 +3,21 @@ import json
 import gzip
 import base64
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import unquote
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from clickhouse_connect import get_client
 
-# Load .env locally
 load_dotenv()
 
-# Vercel requires a top-level Flask instance named app
 app = Flask(__name__)
 
-TABLE_NAME = os.getenv("CLICKHOUSE_TABLE", "webhook_events")
+TABLE_NAME = os.getenv(
+    "CLICKHOUSE_TABLE",
+    "webhook_events"
+)
 
 DECODE_FIELDS = {
     "attackdata_rules",
@@ -43,12 +44,15 @@ def get_ch_client():
 def parse_request_body(req):
     raw = req.get_data()
 
-    encoding = req.headers.get("Content-Encoding", "").lower()
-
-    if "gzip" in encoding or raw.startswith(b"\x1f\x8b"):
+    if (
+        "gzip" in req.headers.get("Content-Encoding", "").lower()
+        or raw.startswith(b"\x1f\x8b")
+    ):
         raw = gzip.decompress(raw)
 
-    return json.loads(raw.decode("utf-8", errors="replace"))
+    return json.loads(
+        raw.decode("utf-8", errors="replace")
+    )
 
 
 def flatten(data, parent_key=""):
@@ -70,11 +74,7 @@ def flatten(data, parent_key=""):
         )
 
     else:
-        result[parent_key] = (
-            str(data)
-            if data is not None
-            else None
-        )
+        result[parent_key] = data
 
     return result
 
@@ -88,27 +88,23 @@ def sanitize_column_name(name):
 
 
 def decode_encoded_list(value):
-    decoded_url = unquote(value)
+    decoded = []
 
-    decoded_items = []
-
-    for item in decoded_url.split(";"):
+    for item in unquote(value).split(";"):
         item = item.strip()
 
         if not item:
             continue
 
         try:
-            decoded_items.append(
-                base64.b64decode(item).decode(
-                    "utf-8",
-                    errors="replace"
-                )
+            decoded.append(
+                base64.b64decode(item)
+                .decode("utf-8", errors="replace")
             )
         except Exception:
-            decoded_items.append(item)
+            decoded.append(item)
 
-    return decoded_items
+    return decoded
 
 
 def process_special_fields(data):
@@ -124,7 +120,11 @@ def process_special_fields(data):
                 ensure_ascii=False
             )
         else:
-            processed[key] = value
+            processed[key] = (
+                None
+                if value is None
+                else str(value)
+            )
 
     return processed
 
@@ -134,7 +134,7 @@ def ensure_table_exists(client):
         f"""
         CREATE TABLE IF NOT EXISTS `{TABLE_NAME}`
         (
-            received_at DateTime('UTC')
+            received_at String
         )
         ENGINE = MergeTree
         ORDER BY received_at
@@ -205,18 +205,15 @@ def webhook():
         )
 
         row = {
-            "received_at": datetime.now(
-                timezone.utc
+            "received_at": datetime.utcnow().strftime(
+                "%Y-%m-%d %H:%M:%S"
             ),
-            **data,
+            **data
         }
-
-        columns = list(row.keys())
 
         client.insert(
             TABLE_NAME,
-            [[row[col] for col in columns]],
-            column_names=columns,
+            [row]
         )
 
         return jsonify({
@@ -237,7 +234,9 @@ def webhook():
         }), 400
 
     except Exception as exc:
-        app.logger.exception("Webhook processing failed")
+        app.logger.exception(
+            "Webhook processing failed"
+        )
 
         return jsonify({
             "success": False,
@@ -245,7 +244,6 @@ def webhook():
         }), 500
 
 
-# Alias used by some WSGI runtimes
 application = app
 
 if __name__ == "__main__":
