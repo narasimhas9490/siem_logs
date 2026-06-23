@@ -1,4 +1,5 @@
 Flask
-clickhouse-connect
 python-dotenv
+clickhouse-connect
+pandas
 gunicorn
