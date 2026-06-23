@@ -14,7 +14,7 @@ from clickhouse_connect import get_client
 
 load_dotenv()
 
-app = Flask(**name**)
+app = Flask(__name__)
 
 TABLE_NAME = os.getenv(
 "CLICKHOUSE_TABLE",
