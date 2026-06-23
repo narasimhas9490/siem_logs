@@ -1,13 +1,11 @@
-
 import os
 import json
 import gzip
 import base64
 import re
+from datetime import datetime, timezone
 from urllib.parse import unquote
-from datetime import datetime
 
-import pandas as pd
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from clickhouse_connect import get_client
@@ -49,15 +47,15 @@ def get_ch_client():
     )
 
 
-def parse_body(req):
+def parse_request_body(req):
     raw = req.get_data()
 
     if (
-        "gzip"
-        in req.headers.get(
+        "gzip" in req.headers.get(
             "Content-Encoding",
             ""
         ).lower()
+        or raw.startswith(b"\x1f\x8b")
     ):
         raw = gzip.decompress(raw)
 
@@ -69,33 +67,52 @@ def parse_body(req):
     )
 
 
-def flatten(data, prefix=""):
+def flatten(data, parent=""):
     result = {}
 
     if isinstance(data, dict):
-        for k, v in data.items():
-            key = (
-                f"{prefix}_{k}"
-                if prefix
-                else k
+        for key, value in data.items():
+            new_key = (
+                f"{parent}_{key}"
+                if parent
+                else key
             )
             result.update(
-                flatten(v, key)
+                flatten(
+                    value,
+                    new_key
+                )
             )
 
     elif isinstance(data, list):
-        result[prefix] = json.dumps(
+        result[parent] = json.dumps(
             data,
             ensure_ascii=False
         )
 
     else:
-        result[prefix] = data
+        result[parent] = value_to_string(data)
 
     return result
 
 
-def sanitize(name):
+def value_to_string(value):
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        (dict, list)
+    ):
+        return json.dumps(
+            value,
+            ensure_ascii=False
+        )
+
+    return str(value)
+
+
+def sanitize_column_name(name):
     return re.sub(
         r"[^a-zA-Z0-9_]",
         "_",
@@ -103,8 +120,8 @@ def sanitize(name):
     ).lower()
 
 
-def decode_special(value):
-    values = []
+def decode_encoded_list(value):
+    decoded = []
 
     for item in unquote(value).split(";"):
         item = item.strip()
@@ -113,7 +130,7 @@ def decode_special(value):
             continue
 
         try:
-            values.append(
+            decoded.append(
                 base64.b64decode(item)
                 .decode(
                     "utf-8",
@@ -121,152 +138,154 @@ def decode_special(value):
                 )
             )
         except Exception:
-            values.append(item)
+            decoded.append(item)
 
-    return values
+    return decoded
 
 
-def process_fields(data):
-    output = {}
+def process_special_fields(data):
+    processed = {}
 
-    for k, v in data.items():
+    for key, value in data.items():
 
         if (
-            k in DECODE_FIELDS
-            and isinstance(v, str)
+            key in DECODE_FIELDS
+            and isinstance(value, str)
         ):
-            output[k] = json.dumps(
-                decode_special(v),
+            processed[key] = json.dumps(
+                decode_encoded_list(value),
                 ensure_ascii=False
             )
         else:
-            output[k] = (
-                None
-                if v is None
-                else str(v)
-            )
+            processed[key] = value
 
-    return output
+    return processed
 
 
-def ensure_table(client):
+def ensure_table_exists(client):
     client.command(
         f"""
         CREATE TABLE IF NOT EXISTS `{TABLE_NAME}`
         (
-            received_at Nullable(String)
+            received_at DateTime('UTC')
         )
         ENGINE = MergeTree
-        ORDER BY tuple()
+        ORDER BY received_at
         """
     )
 
 
-def existing_columns(client):
-    rows = client.query(
+def get_existing_columns(client):
+    result = client.query(
         f"DESCRIBE TABLE `{TABLE_NAME}`"
-    ).result_rows
+    )
 
     return {
         row[0]
-        for row in rows
+        for row in result.result_rows
     }
 
 
-def add_columns(client, cols):
-    current = existing_columns(client)
+def add_missing_columns(client, columns):
+    existing = get_existing_columns(client)
 
-    for col in cols:
-        if col not in current:
+    for column in columns:
+
+        if column not in existing:
+
             client.command(
                 f"""
                 ALTER TABLE `{TABLE_NAME}`
                 ADD COLUMN IF NOT EXISTS
-                `{col}` Nullable(String)
+                `{column}` Nullable(String)
                 """
             )
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify(
-        {
-            "status": "ok",
-            "table": TABLE_NAME,
-        }
-    )
+    return jsonify({
+        "status": "ok",
+        "table": TABLE_NAME
+    })
 
 
 @app.route("/", methods=["POST"])
 def webhook():
-
     try:
 
-        payload = parse_body(request)
+        payload = parse_request_body(
+            request
+        )
 
         if not isinstance(
             payload,
             dict
         ):
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": "JSON root must be object",
-                    }
-                ),
-                400,
-            )
+            return jsonify({
+                "success": False,
+                "error": "JSON root must be an object"
+            }), 400
 
-        flat = flatten(payload)
+        flattened = flatten(payload)
 
         data = {
-            sanitize(k): v
-            for k, v in flat.items()
+            sanitize_column_name(k): v
+            for k, v in flattened.items()
         }
 
-        data = process_fields(data)
-
-        data["received_at"] = datetime.utcnow().isoformat()
+        data = process_special_fields(data)
 
         client = get_ch_client()
 
-        ensure_table(client)
+        ensure_table_exists(client)
 
-        add_columns(
+        add_missing_columns(
             client,
             data.keys()
         )
 
-        df = pd.DataFrame([data])
+        row = {
+            "received_at": datetime.now(
+                timezone.utc
+            ),
+            **data
+        }
 
-        client.insert_df(
+        columns = list(
+            row.keys()
+        )
+
+        values = [
+            row[col]
+            for col in columns
+        ]
+
+        client.insert(
             TABLE_NAME,
-            df
+            [values],
+            column_names=columns
         )
 
-        return jsonify(
-            {
-                "success": True,
-                "columns_inserted": len(data),
-            }
-        )
+        return jsonify({
+            "success": True,
+            "columns_inserted": len(data)
+        })
 
     except Exception as exc:
 
         import traceback
 
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": str(exc),
-                    "type": type(exc).__name__,
-                    "traceback": traceback.format_exc(),
-                }
-            ),
-            500,
+        app.logger.exception(
+            "Webhook processing failed"
         )
+
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "traceback": traceback.format_exc()
+        }), 500
 
 
 application = app
@@ -279,5 +298,5 @@ if __name__ == "__main__":
                 "PORT",
                 5000
             )
-        ),
+        )
     )
