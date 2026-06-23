@@ -1,11 +1,13 @@
+```python
 import os
 import json
 import gzip
 import base64
 import re
-from datetime import datetime
 from urllib.parse import unquote
+from datetime import datetime
 
+import pandas as pd
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from clickhouse_connect import get_client
@@ -36,50 +38,64 @@ def get_ch_client():
         port=int(os.getenv("CLICKHOUSE_PORT", "8443")),
         username=os.getenv("CLICKHOUSE_USER"),
         password=os.getenv("CLICKHOUSE_PASSWORD"),
-        database=os.getenv("CLICKHOUSE_DATABASE", "default"),
-        secure=os.getenv("CLICKHOUSE_SECURE", "true").lower() == "true",
+        database=os.getenv(
+            "CLICKHOUSE_DATABASE",
+            "default"
+        ),
+        secure=os.getenv(
+            "CLICKHOUSE_SECURE",
+            "true"
+        ).lower() == "true",
     )
 
 
-def parse_request_body(req):
+def parse_body(req):
     raw = req.get_data()
 
     if (
-        "gzip" in req.headers.get("Content-Encoding", "").lower()
-        or raw.startswith(b"\x1f\x8b")
+        "gzip"
+        in req.headers.get(
+            "Content-Encoding",
+            ""
+        ).lower()
     ):
         raw = gzip.decompress(raw)
 
     return json.loads(
-        raw.decode("utf-8", errors="replace")
+        raw.decode(
+            "utf-8",
+            errors="replace"
+        )
     )
 
 
-def flatten(data, parent_key=""):
+def flatten(data, prefix=""):
     result = {}
 
     if isinstance(data, dict):
-        for key, value in data.items():
-            new_key = (
-                f"{parent_key}_{key}"
-                if parent_key
-                else key
+        for k, v in data.items():
+            key = (
+                f"{prefix}_{k}"
+                if prefix
+                else k
             )
-            result.update(flatten(value, new_key))
+            result.update(
+                flatten(v, key)
+            )
 
     elif isinstance(data, list):
-        result[parent_key] = json.dumps(
+        result[prefix] = json.dumps(
             data,
             ensure_ascii=False
         )
 
     else:
-        result[parent_key] = data
+        result[prefix] = data
 
     return result
 
 
-def sanitize_column_name(name):
+def sanitize(name):
     return re.sub(
         r"[^a-zA-Z0-9_]",
         "_",
@@ -87,8 +103,8 @@ def sanitize_column_name(name):
     ).lower()
 
 
-def decode_encoded_list(value):
-    decoded = []
+def decode_special(value):
+    values = []
 
     for item in unquote(value).split(";"):
         item = item.strip()
@@ -97,151 +113,160 @@ def decode_encoded_list(value):
             continue
 
         try:
-            decoded.append(
+            values.append(
                 base64.b64decode(item)
-                .decode("utf-8", errors="replace")
+                .decode(
+                    "utf-8",
+                    errors="replace"
+                )
             )
         except Exception:
-            decoded.append(item)
+            values.append(item)
 
-    return decoded
+    return values
 
 
-def process_special_fields(data):
-    processed = {}
+def process_fields(data):
+    output = {}
 
-    for key, value in data.items():
+    for k, v in data.items():
+
         if (
-            key in DECODE_FIELDS
-            and isinstance(value, str)
+            k in DECODE_FIELDS
+            and isinstance(v, str)
         ):
-            processed[key] = json.dumps(
-                decode_encoded_list(value),
+            output[k] = json.dumps(
+                decode_special(v),
                 ensure_ascii=False
             )
         else:
-            processed[key] = (
+            output[k] = (
                 None
-                if value is None
-                else str(value)
+                if v is None
+                else str(v)
             )
 
-    return processed
+    return output
 
 
-def ensure_table_exists(client):
+def ensure_table(client):
     client.command(
         f"""
         CREATE TABLE IF NOT EXISTS `{TABLE_NAME}`
         (
-            received_at String
+            received_at Nullable(String)
         )
         ENGINE = MergeTree
-        ORDER BY received_at
+        ORDER BY tuple()
         """
     )
 
 
-def get_existing_columns(client):
-    result = client.query(
+def existing_columns(client):
+    rows = client.query(
         f"DESCRIBE TABLE `{TABLE_NAME}`"
-    )
+    ).result_rows
 
     return {
         row[0]
-        for row in result.result_rows
+        for row in rows
     }
 
 
-def add_missing_columns(client, columns):
-    existing = get_existing_columns(client)
+def add_columns(client, cols):
+    current = existing_columns(client)
 
-    for column in columns:
-        if column not in existing:
+    for col in cols:
+        if col not in current:
             client.command(
                 f"""
                 ALTER TABLE `{TABLE_NAME}`
                 ADD COLUMN IF NOT EXISTS
-                `{column}` Nullable(String)
+                `{col}` Nullable(String)
                 """
             )
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "table": TABLE_NAME
-    })
+    return jsonify(
+        {
+            "status": "ok",
+            "table": TABLE_NAME,
+        }
+    )
 
 
 @app.route("/", methods=["POST"])
 def webhook():
+
     try:
-        payload = parse_request_body(request)
 
-        if not isinstance(payload, dict):
-            return jsonify({
-                "success": False,
-                "error": "JSON root must be an object"
-            }), 400
+        payload = parse_body(request)
 
-        flattened = flatten(payload)
+        if not isinstance(
+            payload,
+            dict
+        ):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "JSON root must be object",
+                    }
+                ),
+                400,
+            )
+
+        flat = flatten(payload)
 
         data = {
-            sanitize_column_name(k): v
-            for k, v in flattened.items()
+            sanitize(k): v
+            for k, v in flat.items()
         }
 
-        data = process_special_fields(data)
+        data = process_fields(data)
+
+        data["received_at"] = datetime.utcnow().isoformat()
 
         client = get_ch_client()
 
-        ensure_table_exists(client)
+        ensure_table(client)
 
-        add_missing_columns(
+        add_columns(
             client,
             data.keys()
         )
 
-        row = {
-            "received_at": datetime.utcnow().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            **data
-        }
+        df = pd.DataFrame([data])
 
-        client.insert(
+        client.insert_df(
             TABLE_NAME,
-            [row]
+            df
         )
 
-        return jsonify({
-            "success": True,
-            "columns_inserted": len(data)
-        })
-
-    except gzip.BadGzipFile as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 400
-
-    except json.JSONDecodeError as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 400
+        return jsonify(
+            {
+                "success": True,
+                "columns_inserted": len(data),
+            }
+        )
 
     except Exception as exc:
-        app.logger.exception(
-            "Webhook processing failed"
-        )
 
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 500
+        import traceback
+
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                    "traceback": traceback.format_exc(),
+                }
+            ),
+            500,
+        )
 
 
 application = app
@@ -249,5 +274,11 @@ application = app
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 5000))
+        port=int(
+            os.getenv(
+                "PORT",
+                5000
+            )
+        ),
     )
+```
