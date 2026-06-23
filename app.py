@@ -2,25 +2,32 @@ import os
 import json
 import gzip
 import re
+import base64
+from urllib.parse import unquote
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from clickhouse_connect import get_client
 
-
-# Load .env for local development.
-# Vercel uses Environment Variables automatically.
 load_dotenv()
 
-
 app = Flask(__name__)
-
 
 TABLE_NAME = os.getenv(
     "CLICKHOUSE_TABLE",
     "webhook_events"
 )
+
+DECODE_FIELDS = {
+    "attackdata_rules",
+    "attackdata_ruleversions",
+    "attackdata_rulemessages",
+    "attackdata_ruletags",
+    "attackdata_ruledata",
+    "attackdata_ruleselectors",
+    "attackdata_ruleactions",
+}
 
 
 def get_ch_client():
@@ -126,6 +133,76 @@ def sanitize_column_name(name):
     return name.lower()
 
 
+def decode_encoded_list(value):
+    """
+    Converts:
+
+    OTUwMDAy%3bOTUwMDA2%3bQ01ELUlOSkVDVElPTi1BTk9NQUxZ
+
+    into
+
+    [
+        "950002",
+        "950006",
+        "CMD-INJECTION-ANOMALY"
+    ]
+    """
+
+    if not value:
+        return []
+
+    try:
+        decoded_url = unquote(value)
+
+        result = []
+
+        for item in decoded_url.split(";"):
+            item = item.strip()
+
+            if not item:
+                continue
+
+            try:
+                decoded = (
+                    base64
+                    .b64decode(item)
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+                result.append(decoded)
+
+            except Exception:
+                result.append(item)
+
+        return result
+
+    except Exception:
+        return []
+
+
+def process_special_fields(data):
+    processed = {}
+
+    for key, value in data.items():
+
+        if (
+            key in DECODE_FIELDS
+            and isinstance(value, str)
+        ):
+            processed[key] = json.dumps(
+                decode_encoded_list(value),
+                ensure_ascii=False,
+            )
+
+        else:
+            processed[key] = value
+
+    return processed
+
+
 def ensure_table_exists(client):
     client.command(
         f"""
@@ -185,33 +262,28 @@ def webhook():
             return jsonify(
                 {
                     "success": False,
-                    "error": (
-                        "JSON root must be an object"
-                    ),
+                    "error":
+                        "JSON root must be an object",
                 }
             ), 400
 
-
         flattened = flatten(payload)
-
 
         data = {
             sanitize_column_name(key): value
             for key, value in flattened.items()
         }
 
+        data = process_special_fields(data)
 
         client = get_ch_client()
 
-
         ensure_table_exists(client)
-
 
         add_missing_columns(
             client,
             data.keys(),
         )
-
 
         row = {
             "received_at": datetime.now(
@@ -220,9 +292,7 @@ def webhook():
             **data,
         }
 
-
         columns = list(row.keys())
-
 
         client.insert(
             TABLE_NAME,
@@ -235,7 +305,6 @@ def webhook():
             column_names=columns,
         )
 
-
         return jsonify(
             {
                 "success": True,
@@ -243,24 +312,23 @@ def webhook():
             }
         )
 
-
     except gzip.BadGzipFile:
         return jsonify(
             {
                 "success": False,
-                "error": "Invalid gzip payload",
+                "error":
+                    "Invalid gzip payload",
             }
         ), 400
-
 
     except json.JSONDecodeError:
         return jsonify(
             {
                 "success": False,
-                "error": "Invalid JSON payload",
+                "error":
+                    "Invalid JSON payload",
             }
         ), 400
-
 
     except Exception as exc:
         app.logger.exception(
@@ -273,7 +341,6 @@ def webhook():
                 "error": str(exc),
             }
         ), 500
-
 
 
 # Vercel entrypoint
