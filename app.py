@@ -6,13 +6,9 @@ import re
 from urllib.parse import unquote
 from datetime import datetime, timezone
 
-from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
 from clickhouse_connect import get_client
-
-# Load .env for local development.
-
-# Vercel uses Environment Variables automatically.
 
 load_dotenv()
 
@@ -34,45 +30,20 @@ DECODE_FIELDS = {
 }
 
 def get_ch_client():
-required = [
-"CLICKHOUSE_HOST",
-"CLICKHOUSE_USER",
-"CLICKHOUSE_PASSWORD",
-]
-
-```
-missing = [
-    key
-    for key in required
-    if not os.getenv(key)
-]
-
-if missing:
-    raise RuntimeError(
-        "Missing environment variables: "
-        + ", ".join(missing)
-    )
-
 return get_client(
-    host=os.environ["CLICKHOUSE_HOST"],
-    port=int(
-        os.getenv(
-            "CLICKHOUSE_PORT",
-            "8443",
-        )
-    ),
-    username=os.environ["CLICKHOUSE_USER"],
-    password=os.environ["CLICKHOUSE_PASSWORD"],
-    database=os.getenv(
-        "CLICKHOUSE_DATABASE",
-        "default",
-    ),
-    secure=os.getenv(
-        "CLICKHOUSE_SECURE",
-        "true",
-    ).lower() == "true",
+host=os.environ["CLICKHOUSE_HOST"],
+port=int(os.getenv("CLICKHOUSE_PORT", "8443")),
+username=os.environ["CLICKHOUSE_USER"],
+password=os.environ["CLICKHOUSE_PASSWORD"],
+database=os.getenv(
+"CLICKHOUSE_DATABASE",
+"default",
+),
+secure=os.getenv(
+"CLICKHOUSE_SECURE",
+"true",
+).lower() == "true",
 )
-```
 
 def parse_request_body(req):
 raw = req.get_data()
@@ -130,36 +101,17 @@ return output
 ```
 
 def sanitize_column_name(name):
-name = re.sub(
+return re.sub(
 r"[^a-zA-Z0-9_]",
 "_",
 name,
-)
-
-```
-return name.lower()
-```
+).lower()
 
 def decode_encoded_list(value):
-"""
-URL decode -> split(';') -> Base64 decode
+if not isinstance(value, str):
+return value
 
 ```
-Example:
-OTUwMDAy%3bOTUwMDA2%3bQ01ELUlOSkVDVElPTi1BTk9NQUxZ
-
-becomes
-
-[
-    "950002",
-    "950006",
-    "CMD-INJECTION-ANOMALY"
-]
-"""
-
-if not isinstance(value, str):
-    return value
-
 decoded_url = unquote(value)
 
 result = []
@@ -171,19 +123,13 @@ for item in decoded_url.split(";"):
         continue
 
     try:
-        decoded = (
-            base64
-            .b64decode(item)
-            .decode(
+        result.append(
+            base64.b64decode(item).decode(
                 "utf-8",
                 errors="replace",
             )
         )
-
-        result.append(decoded)
-
     except Exception:
-        # Keep original item if decode fails
         result.append(item)
 
 return result
@@ -260,18 +206,18 @@ return jsonify(
 
 @app.route("/", methods=["POST"])
 def webhook():
+try:
 
 ```
-try:
-    payload = parse_request_body(request)
+    payload = parse_request_body(
+        request
+    )
 
     if not isinstance(payload, dict):
         return jsonify(
             {
                 "success": False,
-                "error": (
-                    "JSON root must be an object"
-                ),
+                "error": "JSON root must be an object",
             }
         ), 400
 
@@ -337,10 +283,6 @@ except json.JSONDecodeError:
     ), 400
 
 except Exception as exc:
-    app.logger.exception(
-        "Webhook processing failed"
-    )
-
     return jsonify(
         {
             "success": False,
@@ -348,7 +290,3 @@ except Exception as exc:
         }
     ), 500
 ```
-
-# Vercel entrypoint
-
-app = app
