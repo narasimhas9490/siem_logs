@@ -1,4 +1,4 @@
-```python
+
 import os
 import json
 import gzip
@@ -281,4 +281,3 @@ if __name__ == "__main__":
             )
         ),
     )
-```
